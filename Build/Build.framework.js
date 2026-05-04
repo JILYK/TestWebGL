@@ -1713,6 +1713,244 @@ function dbg(text) {
       return mediaDevices && mediaDevices.getUserMedia ? 1 : 0;
     }
 
+  var ClapMicRuntime = {parseSettings:function (settingsJson) {
+        var defaults = {
+          sampleRate: 48000,
+          analysisWindow: 1024,
+          preferredDeviceName: "",
+          minRms: 0.035,
+          minPeak: 0.18,
+          noiseMultiplier: 5.5,
+          minCrest: 3.2,
+          minAttack: 1.35,
+          minHighFrequencyRatio: 0.34,
+          minZeroCrossingRate: 0.08,
+          maxZeroCrossingRate: 0.52,
+          cooldownSeconds: 0.18,
+          startupCalibrationSeconds: 1.0,
+          initialNoiseFloor: 0.008,
+          silenceLearningMaxRms: 0.06,
+          noiseLearningSpeed: 0.08
+        };
+  
+        try {
+          var parsed = JSON.parse(settingsJson);
+          for (var key in parsed) {
+            if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+              defaults[key] = parsed[key];
+            }
+          }
+        } catch (error) {
+        }
+  
+        return defaults;
+      },getAudioConstraints:function (state) {
+        var baseAudio = {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+          sampleRate: state.settings.sampleRate
+        };
+  
+        var preferred = (state.settings.preferredDeviceName || "").toLowerCase();
+        if (!preferred || !navigator.mediaDevices.enumerateDevices) {
+          return Promise.resolve({ audio: baseAudio, video: false });
+        }
+  
+        return navigator.mediaDevices.enumerateDevices().then(function (devices) {
+          for (var i = 0; i < devices.length; i++) {
+            var device = devices[i];
+            var label = (device.label || "").toLowerCase();
+            if (device.kind === "audioinput" && label.indexOf(preferred) >= 0) {
+              baseAudio.deviceId = { exact: device.deviceId };
+              break;
+            }
+          }
+  
+          return { audio: baseAudio, video: false };
+        }).catch(function () {
+          return { audio: baseAudio, video: false };
+        });
+      },createGraph:function (stream) {
+        var state = window.__clapMic;
+        var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        var context = new AudioContextCtor({ sampleRate: state.settings.sampleRate });
+        var source = context.createMediaStreamSource(stream);
+        var bufferSize = ClapMicRuntime.closestBufferSize(state.settings.analysisWindow);
+        var processor = context.createScriptProcessor(bufferSize, 1, 1);
+  
+        processor.onaudioprocess = function (event) {
+          ClapMicRuntime.process(event.inputBuffer.getChannelData(0));
+        };
+  
+        source.connect(processor);
+        processor.connect(context.destination);
+  
+        state.stream = stream;
+        state.context = context;
+        state.source = source;
+        state.processor = processor;
+  
+        if (context.state === "suspended") {
+          context.resume();
+        }
+  
+        ClapMicRuntime.sendStatus("listening");
+      },sendDeviceList:function () {
+        var state = window.__clapMic;
+        if (!state || !navigator.mediaDevices.enumerateDevices) {
+          return;
+        }
+  
+        navigator.mediaDevices.enumerateDevices().then(function (devices) {
+          var names = [];
+          for (var i = 0; i < devices.length; i++) {
+            var device = devices[i];
+            if (device.kind !== "audioinput") {
+              continue;
+            }
+  
+            var name = device.label || ("Microphone " + (names.length + 1));
+            if (names.indexOf(name) < 0) {
+              names.push(name);
+            }
+          }
+  
+          if (names.length > 0) {
+            SendMessage(state.callbackObjectName, "OnWebGLMicrophoneDevices", names.join("\n"));
+          }
+        });
+      },closestBufferSize:function (requested) {
+        var sizes = [256, 512, 1024, 2048, 4096];
+        var best = 1024;
+        var bestDelta = Math.abs(requested - best);
+        for (var i = 0; i < sizes.length; i++) {
+          var delta = Math.abs(requested - sizes[i]);
+          if (delta < bestDelta) {
+            best = sizes[i];
+            bestDelta = delta;
+          }
+        }
+  
+        return best;
+      },process:function (input) {
+        var state = window.__clapMic;
+        if (!state || !state.callbackObjectName) {
+          return;
+        }
+  
+        var settings = state.settings;
+        var length = input.length;
+        var sumSquares = 0;
+        var diffSquares = 0;
+        var peak = 0;
+        var zeroCrossings = 0;
+        var previous = input[0] || 0;
+  
+        for (var i = 0; i < length; i++) {
+          var sample = input[i] || 0;
+          var abs = Math.abs(sample);
+          if (abs > peak) {
+            peak = abs;
+          }
+  
+          sumSquares += sample * sample;
+  
+          if (i > 0) {
+            var diff = sample - previous;
+            diffSquares += diff * diff;
+            if ((sample >= 0 && previous < 0) || (sample < 0 && previous >= 0)) {
+              zeroCrossings++;
+            }
+          }
+  
+          previous = sample;
+        }
+  
+        var rms = Math.sqrt(sumSquares / Math.max(1, length));
+        var diffRms = Math.sqrt(diffSquares / Math.max(1, length - 1));
+        var highRatio = Math.min(1, diffRms / (rms * 2 + 0.000001));
+        var zcr = zeroCrossings / Math.max(1, length - 1);
+        var crest = peak / (rms + 0.000001);
+        var attack = rms / (state.previousRms + 0.00001);
+        var now = performance.now() / 1000;
+        var calibration = now < state.calibrationUntil;
+  
+        if (calibration || rms <= settings.silenceLearningMaxRms) {
+          var learn = calibration ? 0.35 : settings.noiseLearningSpeed;
+          state.noiseFloor = state.noiseFloor + (Math.max(rms, 0.0005) - state.noiseFloor) * learn;
+        }
+  
+        var reason = ClapMicRuntime.evaluate(settings, state, rms, peak, highRatio, zcr, crest, attack, calibration, now);
+        var payload = ClapMicRuntime.formatPayload(rms, peak, state.noiseFloor, highRatio, zcr, crest, attack, reason);
+  
+        if (now - state.lastMetricsSent > 0.05) {
+          state.lastMetricsSent = now;
+          SendMessage(state.callbackObjectName, "OnWebGLMicrophoneMetrics", payload);
+        }
+  
+        if (reason === "clap") {
+          state.nextAllowedClapTime = now + settings.cooldownSeconds;
+          SendMessage(state.callbackObjectName, "OnWebGLClapDetected", payload);
+        }
+  
+        state.previousRms = rms;
+      },evaluate:function (settings, state, rms, peak, highRatio, zcr, crest, attack, calibration, now) {
+        if (calibration) {
+          return "calibration";
+        }
+        if (now < state.nextAllowedClapTime) {
+          return "cooldown";
+        }
+        if (rms < settings.minRms) {
+          return "rms";
+        }
+        if (peak < settings.minPeak) {
+          return "peak";
+        }
+        if (rms < state.noiseFloor * settings.noiseMultiplier) {
+          return "noise";
+        }
+        if (crest < settings.minCrest) {
+          return "crest";
+        }
+  
+        var strongImpulse =
+          peak >= settings.minPeak * 1.25 &&
+          rms >= Math.max(settings.minRms * 1.1, state.noiseFloor * settings.noiseMultiplier * 1.15) &&
+          crest >= settings.minCrest * 0.9 &&
+          highRatio >= settings.minHighFrequencyRatio * 0.85;
+  
+        if (attack < settings.minAttack && !strongImpulse) {
+          return "attack";
+        }
+        if (highRatio < settings.minHighFrequencyRatio) {
+          return "high-frequency";
+        }
+        if (zcr < settings.minZeroCrossingRate || zcr > settings.maxZeroCrossingRate) {
+          return "zero-crossing";
+        }
+  
+        return "clap";
+      },formatPayload:function (rms, peak, noiseFloor, highRatio, zcr, crest, attack, reason) {
+        return [
+          rms.toFixed(6),
+          peak.toFixed(6),
+          noiseFloor.toFixed(6),
+          highRatio.toFixed(6),
+          zcr.toFixed(6),
+          crest.toFixed(6),
+          attack.toFixed(6),
+          reason
+        ].join("|");
+      },sendStatus:function (status) {
+        var state = window.__clapMic;
+        if (state && state.callbackObjectName) {
+          SendMessage(state.callbackObjectName, "OnWebGLMicrophoneStatus", status);
+        }
+      }};
+  
   function _ClapMic_Start(callbackObjectNamePtr, settingsJsonPtr) {
       var callbackObjectName = UTF8ToString(callbackObjectNamePtr);
       var settingsJson = UTF8ToString(settingsJsonPtr);
@@ -1739,24 +1977,24 @@ function dbg(text) {
   
       var state = window.__clapMic;
       state.callbackObjectName = callbackObjectName;
-      state.settings = ClapMic_ParseSettings(settingsJson);
+      state.settings = ClapMicRuntime.parseSettings(settingsJson);
       state.previousRms = state.settings.initialNoiseFloor;
       state.noiseFloor = state.settings.initialNoiseFloor;
       state.calibrationUntil = performance.now() / 1000 + state.settings.startupCalibrationSeconds;
       state.nextAllowedClapTime = 0;
   
       if (state.context) {
-        ClapMic_SendStatus("started");
+        ClapMicRuntime.sendStatus("started");
         return 1;
       }
   
-      ClapMic_GetAudioConstraints(state).then(function (constraints) {
+      ClapMicRuntime.getAudioConstraints(state).then(function (constraints) {
         return navigator.mediaDevices.getUserMedia(constraints);
       }).then(function (stream) {
-        ClapMic_CreateGraph(stream);
-        ClapMic_SendDeviceList();
+        ClapMicRuntime.createGraph(stream);
+        ClapMicRuntime.sendDeviceList();
       }).catch(function (error) {
-        ClapMic_SendStatus("error:" + (error && error.name ? error.name : "getUserMedia"));
+        ClapMicRuntime.sendStatus("error:" + (error && error.name ? error.name : "getUserMedia"));
       });
   
       return 1;
@@ -1791,16 +2029,17 @@ function dbg(text) {
       state.context = null;
       state.source = null;
       state.processor = null;
-      ClapMic_SendStatus("stopped");
+      ClapMicRuntime.sendStatus("stopped");
     }
 
+  
   function _ClapMic_UpdateSettings(settingsJsonPtr) {
       var state = window.__clapMic;
       if (!state) {
         return;
       }
   
-      state.settings = ClapMic_ParseSettings(UTF8ToString(settingsJsonPtr));
+      state.settings = ClapMicRuntime.parseSettings(UTF8ToString(settingsJsonPtr));
     }
 
   function _GetJSLoadTimeInfo(loadTimePtr) {
@@ -19503,6 +19742,7 @@ var unexportedSymbols = [
   'wr',
   'jsWebRequestGetResponseHeaderString',
   'IDBFS',
+  'ClapMicRuntime',
 ];
 unexportedSymbols.forEach(unexportedRuntimeSymbol);
 
